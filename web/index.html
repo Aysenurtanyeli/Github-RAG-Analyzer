@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GitHub RAG Analyzer</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="dot"></div>
+          <div>
+            <div class="title">GitHub RAG Analyzer</div>
+            <div class="subtitle">Repo içeriğine göre sohbet</div>
+          </div>
+        </div>
+        <div class="status" id="status">Bağlanıyor…</div>
+      </header>
+
+      <main class="layout">
+        <section class="panel">
+          <h2>Repo</h2>
+          <p class="muted">
+            GitHub repo URL (veya <code>owner/repo</code>) gir, ingest et, sonra sor.
+          </p>
+          <label class="label" for="repoUrl">Repo</label>
+          <input id="repoUrl" class="input" placeholder="https://github.com/owner/repo" />
+
+          <div class="row">
+            <div class="col">
+              <label class="label" for="branch">Branch</label>
+              <select id="branch" class="input">
+                <option value="main" selected>main</option>
+                <option value="master">master</option>
+              </select>
+            </div>
+            <div class="col">
+              <label class="label" for="force">Veriyi yeniden oluştur</label>
+              <select id="force" class="input">
+                <option value="false" selected>Hayır (mevcut veriyi kullan)</option>
+                <option value="true">Evet (eski veriyi sil, baştan yükle)</option>
+              </select>
+            </div>
+          </div>
+
+          <button class="button" id="btnIngest">Repo verisini yükle ve indeksle</button>
+          <button class="button secondary" id="btnStopIngest" disabled>Durdur</button>
+          <div class="card" id="ingestResult" hidden></div>
+
+          <div class="divider"></div>
+
+          <h2>Sohbet</h2>
+          <p class="muted" id="nsRow" hidden>
+            Aktif repo namespace: <code id="activeNs">-</code>
+          </p>
+          <label class="label" for="question">Soru</label>
+          <textarea id="question" class="input textarea" rows="4" placeholder="Örn: Bu repoda auth nasıl çalışıyor?"></textarea>
+
+          <div class="row">
+            <div class="col">
+              <label class="label" for="topk">Kaynak sayısı</label>
+              <select id="topk" class="input">
+                <option>2</option>
+                <option selected>4</option>
+                <option>6</option>
+                <option>8</option>
+                <option>10</option>
+              </select>
+            </div>
+            <div class="col">
+              <label class="label" aria-hidden="true">&nbsp;</label>
+              <button class="button secondary" id="btnClear">Sohbeti temizle</button>
+            </div>
+          </div>
+
+          <button class="button" id="btnAsk">Gönder</button>
+        </section>
+
+        <section class="chat">
+          <div class="chatHeader">
+            <div class="chatTitle">Chatbot</div>
+            <div class="chatHint">Yanıtlar repo bağlamından üretilir.</div>
+          </div>
+          <div class="messages" id="messages"></div>
+          <div class="sources" id="sources" hidden></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+

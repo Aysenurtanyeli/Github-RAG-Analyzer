@@ -1,0 +1,62 @@
+# =========================
+# Python & Backend (FastAPI, AI, LangChain)
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Environment Variables & Secrets (Kritik!)
+# =========================
+# Groq, Pinecone ve GitHub API key'lerinin GitHub'a sızmaması için
+.env
+.env.local
+.env.*
+*.secret
+
+# =========================
+# Node.js & Frontend (React / Vite vb.)
+# =========================
+node_modules/
+dist/
+build/
+.next/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json # (Eğer yarn veya pnpm kullanıyorsanız npm'inkini yok sayabilirsiniz)
+
+# =========================
+# Vector DB & Local Data
+# =========================
+# Pinecone'a geçmiş olsanız da projede kalmış olabilecek eski ChromaDB klasörleri
+chroma_db/
+.chroma/
+vector_store/
+local_cache/
+*.sqlite3
+*.db
+
+# =========================
+# OS & IDE Files
+# =========================
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+Thumbs.db
+ehthumbs.db
