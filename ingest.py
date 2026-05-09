@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 import threading
 from pathlib import Path
 from urllib.parse import urlparse
@@ -46,6 +48,44 @@ ALLOWED_EXTENSIONS = {
     ".ini",
 }
 
+DEFAULT_IGNORE_SUBSTRINGS = [
+    "/components/",
+    "/ui/",
+    "/styles/",
+    "/assets/",
+    "/public/",
+    "/layouts/",
+]
+
+# If focus list is non-empty, ONLY these paths/files are ingested.
+DEFAULT_FOCUS_SUBSTRINGS = [
+    "/services/",
+    "/store/",
+    "/hooks/",
+    "/routes/",
+    "/context/",
+    "/utils/",
+    "/src/services/",
+    "/src/store/",
+    "/src/hooks/",
+    "/src/routes/",
+    "/src/context/",
+    "/src/utils/",
+    "/app/services/",
+    "/app/store/",
+    "/app/hooks/",
+    "/app/routes/",
+    "/app/context/",
+    "/app/utils/",
+    "/main.ts",
+    "/main.tsx",
+    "/main.js",
+    "/index.js",
+    "/index.ts",
+    "/app.ts",
+    "/app.tsx",
+]
+
 
 class IngestCancelled(Exception):
     """Raised when user cancels ingestion."""
@@ -57,7 +97,77 @@ def _file_filter(path: str) -> bool:
         return False
     if "/node_modules/" in lowered or "/venv/" in lowered or "/.venv/" in lowered:
         return False
-    return Path(lowered).suffix in ALLOWED_EXTENSIONS
+
+    suffix = Path(lowered).suffix
+    if suffix not in ALLOWED_EXTENSIONS:
+        return False
+
+    # Allow overriding ignore/focus lists via env (comma-separated substrings).
+    # Examples:
+    #   INGEST_IGNORE_PATHS="/components/,/assets/"
+    #   INGEST_FOCUS_PATHS="/services/,/utils/,/main.tsx"
+    ignore_raw = os.getenv("INGEST_IGNORE_PATHS", "")
+    focus_raw = os.getenv("INGEST_FOCUS_PATHS", "")
+    ignore_list = [s.strip().lower() for s in ignore_raw.split(",") if s.strip()] or DEFAULT_IGNORE_SUBSTRINGS
+    focus_list = [s.strip().lower() for s in focus_raw.split(",") if s.strip()] or []
+
+    # Ignore always wins.
+    if any(sub in lowered for sub in ignore_list):
+        return False
+
+    # If focus list provided (env) use it; else default focus list can be enabled via flag.
+    enable_default_focus = (os.getenv("INGEST_ENABLE_DEFAULT_FOCUS", "true").strip().lower() in {"1", "true", "yes", "y"})
+    effective_focus = focus_list if focus_list else (DEFAULT_FOCUS_SUBSTRINGS if enable_default_focus else [])
+    if effective_focus and not any(sub in lowered for sub in effective_focus):
+        return False
+
+    return True
+
+
+_SIG_KEEP_RE = re.compile(
+    r"^\s*(export\s+)?(default\s+)?(async\s+)?"
+    r"(function|class|interface|type|enum|const|let|var)\b|^\s*import\b|^\s*from\b",
+    re.IGNORECASE,
+)
+
+
+def _signature_only_text(text: str) -> str:
+    """
+    Heuristic "signature-only" reducer for JS/TS (including TSX/JSX).
+    Keeps imports/exports and top-level declarations, plus nearby comments.
+    Avoids pulling large JSX/HTML bodies into embeddings.
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    comment_buffer: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Keep short comment blocks only if followed by a signature.
+        if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*") or stripped.startswith("*/"):
+            comment_buffer.append(line)
+            if len(comment_buffer) > 8:
+                comment_buffer = comment_buffer[-8:]
+            continue
+
+        if _SIG_KEEP_RE.search(line):
+            if comment_buffer:
+                out.extend(comment_buffer)
+                comment_buffer = []
+            out.append(line)
+            continue
+
+        # Drop likely JSX/HTML-heavy lines
+        if "<" in line and ">" in line:
+            comment_buffer = []
+            continue
+
+        # Reset comment buffer when encountering unrelated code to avoid attaching stale comments.
+        if stripped:
+            comment_buffer = []
+
+    return "\n".join(out).strip()
 
 
 def _build_splitter(
@@ -88,6 +198,14 @@ def _split_documents(
             raise IngestCancelled()
         source = str(doc.metadata.get("path") or doc.metadata.get("source") or "")
         extension = Path(source).suffix.lower()
+
+        # Optional: shrink JS/TS/TSX/JSX to signatures only before chunking/embedding.
+        sig_only = os.getenv("INGEST_SIGNATURE_ONLY", "true").strip().lower() in {"1", "true", "yes", "y"}
+        if sig_only and extension in {".js", ".ts", ".tsx", ".jsx"} and isinstance(doc.page_content, str):
+            reduced = _signature_only_text(doc.page_content)
+            if reduced:
+                doc.page_content = reduced
+
         splitter = _build_splitter(
             extension=extension,
             chunk_size=chunk_size,
@@ -178,15 +296,52 @@ def ingest_repo(
         )
     )
 
+    # NOTE: file_filter is applied before downloading file content.
+    # If focus filters are too strict (common for small repos), loader may return 0 docs.
+    # In that case we retry once with focus disabled (ignore list still applies).
+
+    def _filter_relaxed(path: str) -> bool:
+        # Temporarily disable focus list by overriding env knob.
+        prev = os.getenv("INGEST_ENABLE_DEFAULT_FOCUS")
+        try:
+            os.environ["INGEST_ENABLE_DEFAULT_FOCUS"] = "false"
+            os.environ.pop("INGEST_FOCUS_PATHS", None)
+            return _file_filter(path)
+        finally:
+            # restore previous env to avoid side-effects outside this call
+            if prev is None:
+                os.environ.pop("INGEST_ENABLE_DEFAULT_FOCUS", None)
+            else:
+                os.environ["INGEST_ENABLE_DEFAULT_FOCUS"] = prev
+
     loader = GithubFileLoader(
         repo=repo_name,
         branch=repo_branch,
-        access_token=settings.github_token,
+        access_token=settings.github_token or "",
         file_filter=_file_filter,
     )
     docs = loader.load()
     if not docs:
-        raise RuntimeError("GithubFileLoader herhangi bir belge dondurmedi.")
+        # Retry with relaxed focus if focus was enabled.
+        enable_default_focus = (
+            os.getenv("INGEST_ENABLE_DEFAULT_FOCUS", "true").strip().lower()
+            in {"1", "true", "yes", "y"}
+        )
+        has_focus_env = bool(os.getenv("INGEST_FOCUS_PATHS", "").strip())
+        if enable_default_focus or has_focus_env:
+            loader2 = GithubFileLoader(
+                repo=repo_name,
+                branch=repo_branch,
+                access_token=settings.github_token or "",
+                file_filter=_filter_relaxed,
+            )
+            docs = loader2.load()
+    if not docs:
+        raise RuntimeError(
+            "GithubFileLoader herhangi bir belge dondurmedi. "
+            "Repo bos olabilir, branch yanlis olabilir veya filtreler (focus/ignore) tum dosyalari elemis olabilir. "
+            "Cozum: INGEST_ENABLE_DEFAULT_FOCUS=false yapip tekrar dene."
+        )
     if cancel_event and cancel_event.is_set():
         raise IngestCancelled()
 

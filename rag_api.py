@@ -8,6 +8,8 @@ from typing import List, Optional
 from urllib.parse import urlparse
 import threading
 import uuid
+from dataclasses import asdict
+import multiprocessing as mp
 
 import requests
 
@@ -35,29 +37,88 @@ app.add_middleware(
 )
 
 # ── Servislerin Hazırlanması ─────────────────────────────────────
-settings = get_settings()
-embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
-llm = ChatGroq(temperature=0, model_name=settings.llm_model, groq_api_key=settings.groq_api_key)
+# Not: Zorunlu env değişkenleri yoksa uygulamanın "boot" etmesini engellemek
+# yerine API'nin çalışmasını sağlar, ilgili endpoint'lerde anlamlı hata döner.
+settings = None
+embeddings = None
+llm = None
+pc = None
+pinecone_index = None
+SERVICE_INIT_ERROR: str | None = None
 
-pc = Pinecone(api_key=settings.pinecone_api_key)
-existing = {idx["name"] for idx in pc.list_indexes()}
-dim_probe = embeddings.embed_query("dimension probe")
-if settings.pinecone_index_name not in existing:
-    pc.create_index(
-        name=settings.pinecone_index_name,
-        dimension=len(dim_probe),
-        metric="cosine",
-        spec=ServerlessSpec(cloud=settings.pinecone_cloud, region=settings.pinecone_region),
-    )
-pinecone_index = pc.Index(settings.pinecone_index_name)
+
+def _init_services() -> None:
+    global settings, embeddings, llm, pc, pinecone_index, SERVICE_INIT_ERROR
+    if pinecone_index is not None and embeddings is not None and llm is not None and settings is not None:
+        return
+    try:
+        settings = get_settings()
+        embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
+        llm = ChatGroq(temperature=0, model_name=settings.llm_model, groq_api_key=settings.groq_api_key)
+
+        pc = Pinecone(api_key=settings.pinecone_api_key)
+        existing = {idx["name"] for idx in pc.list_indexes()}
+        dim_probe = embeddings.embed_query("dimension probe")
+        if settings.pinecone_index_name not in existing:
+            pc.create_index(
+                name=settings.pinecone_index_name,
+                dimension=len(dim_probe),
+                metric="cosine",
+                spec=ServerlessSpec(cloud=settings.pinecone_cloud, region=settings.pinecone_region),
+            )
+        pinecone_index = pc.Index(settings.pinecone_index_name)
+        SERVICE_INIT_ERROR = None
+    except Exception as e:
+        SERVICE_INIT_ERROR = str(e)
+
+
+def _require_services() -> None:
+    _init_services()
+    if SERVICE_INIT_ERROR:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Servisler başlatılamadı. Muhtemelen .env / environment değişkenleri eksik. "
+                f"Hata: {SERVICE_INIT_ERROR}"
+            ),
+        )
 
 INGEST_TASKS: dict[str, dict] = {}
 INGEST_LOCK = threading.Lock()
 
+def _ingest_worker(
+    queue: "mp.Queue",
+    *,
+    repo_url: str,
+    repo_branch: str,
+    namespace: str,
+    force: bool,
+    cancel_event,
+) -> None:
+    """
+    Separate process worker for ingestion.
+    This allows hard-cancel (terminate) when GithubFileLoader blocks.
+    """
+    try:
+        result = ingest_repo(
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            namespace=namespace,
+            force=force,
+            cancel_event=cancel_event,
+        )
+        queue.put(("completed", result, None))
+    except IngestCancelled:
+        queue.put(("cancelled", None, None))
+    except Exception as e:
+        queue.put(("failed", None, str(e)))
+
 def _default_namespace() -> str:
+    _require_services()
     return f"{settings.repo_name.replace('/', '__')}__{settings.repo_branch}"
 
 def _vectorstore(namespace: str) -> PineconeVectorStore:
+    _require_services()
     return PineconeVectorStore(index=pinecone_index, embedding=embeddings, namespace=namespace)
 
 def _repo_name_from_url(repo_url: str) -> str:
@@ -74,7 +135,7 @@ def _repo_name_from_url(repo_url: str) -> str:
 # ── Pydantic Modelleri ─────────────────────────────────────────────
 class SoruIstek(BaseModel):
     soru: str = Field(..., min_length=2, description="Sormak istediğiniz soru")
-    top_k: int = Field(default=settings.retriever_k, ge=1, le=10)
+    top_k: int = Field(default=4, ge=1, le=10)
     namespace: Optional[str] = Field(default=None, description="Repo namespace (boşsa default repo)")
 
 class IngestIstek(BaseModel):
@@ -102,7 +163,21 @@ class SoruYanit(BaseModel):
 
 @app.get("/")
 def status():
-    ns = _default_namespace()
+    _init_services()
+    if SERVICE_INIT_ERROR or not settings:
+        return {
+            "durum": "degraded",
+            "hata": SERVICE_INIT_ERROR or "Settings yüklenemedi.",
+            "gerekli_env": [
+                "GITHUB_PERSONAL_ACCESS_TOKEN",
+                "GROQ_API_KEY",
+                "PINECONE_API_KEY",
+                "GITHUB_REPO_URL",
+            ],
+            "ui": "/ui",
+        }
+
+    ns = f"{settings.repo_name.replace('/', '__')}__{settings.repo_branch}"
     try:
         stats = pinecone_index.describe_index_stats()
         ns_count = int((stats.get("namespaces") or {}).get(ns, {}).get("vector_count") or 0)
@@ -115,11 +190,13 @@ def status():
         "pinecone_index": settings.pinecone_index_name,
         "default_namespace": ns,
         "toplam_chunk": ns_count,
-        "ui": "/ui"
+        "ui": "/ui",
+        "settings": {k: v for k, v in asdict(settings).items() if k not in {"github_token", "groq_api_key", "pinecone_api_key"}},
     }
 
 @app.post("/ingest", response_model=IngestYanit)
 def ingest_endpoint(istek: IngestIstek):
+    _require_services()
     repo_name = istek.repo_url.strip()
     safe = repo_name.replace("https://github.com/", "").replace("http://github.com/", "").strip("/")
     safe = safe.replace("/", "__").replace(".git", "")
@@ -134,13 +211,15 @@ def ingest_endpoint(istek: IngestIstek):
 
 @app.post("/ingest_async")
 def ingest_async_endpoint(istek: IngestIstek):
+    _require_services()
     repo_url = istek.repo_url.strip()
     safe = repo_url.replace("https://github.com/", "").replace("http://github.com/", "").strip("/")
     safe = safe.replace("/", "__").replace(".git", "")
     namespace = f"{safe}__{istek.repo_branch}"
 
     task_id = uuid.uuid4().hex
-    cancel_event = threading.Event()
+    cancel_event = mp.Event()
+    result_queue: "mp.Queue" = mp.Queue()
 
     with INGEST_LOCK:
         INGEST_TASKS[task_id] = {
@@ -150,30 +229,62 @@ def ingest_async_endpoint(istek: IngestIstek):
             "repo_branch": istek.repo_branch,
             "force": istek.force,
             "cancel_event": cancel_event,
+            "process": None,
+            "queue": result_queue,
             "result": None,
             "error": None,
         }
 
     def _runner() -> None:
-        try:
-            result = ingest_repo(
-                repo_url=repo_url,
-                repo_branch=istek.repo_branch,
-                namespace=namespace,
-                force=istek.force,
-                cancel_event=cancel_event,
-            )
+        proc = mp.Process(
+            target=_ingest_worker,
+            kwargs={
+                "queue": result_queue,
+                "repo_url": repo_url,
+                "repo_branch": istek.repo_branch,
+                "namespace": namespace,
+                "force": istek.force,
+                "cancel_event": cancel_event,
+            },
+            daemon=True,
+        )
+        proc.start()
+        with INGEST_LOCK:
+            if task_id in INGEST_TASKS:
+                INGEST_TASKS[task_id]["process"] = proc
+
+        # Wait for completion/cancel/terminate and update task status
+        while True:
+            if cancel_event.is_set():
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=5)
+                with INGEST_LOCK:
+                    if task_id in INGEST_TASKS:
+                        INGEST_TASKS[task_id]["status"] = "cancelled"
+                        INGEST_TASKS[task_id]["result"] = None
+                return
+
+            try:
+                status, result, err = result_queue.get(timeout=0.5)
+            except Exception:
+                if not proc.is_alive():
+                    with INGEST_LOCK:
+                        if task_id in INGEST_TASKS and INGEST_TASKS[task_id]["status"] == "running":
+                            INGEST_TASKS[task_id]["status"] = "failed"
+                            INGEST_TASKS[task_id]["error"] = "Ingest process ended unexpectedly."
+                    return
+                continue
+
             with INGEST_LOCK:
-                INGEST_TASKS[task_id]["status"] = "completed"
+                if task_id not in INGEST_TASKS:
+                    return
+                INGEST_TASKS[task_id]["status"] = status
                 INGEST_TASKS[task_id]["result"] = result
-        except IngestCancelled:
-            with INGEST_LOCK:
-                INGEST_TASKS[task_id]["status"] = "cancelled"
-                INGEST_TASKS[task_id]["result"] = None
-        except Exception as e:
-            with INGEST_LOCK:
-                INGEST_TASKS[task_id]["status"] = "failed"
-                INGEST_TASKS[task_id]["error"] = str(e)
+                INGEST_TASKS[task_id]["error"] = err
+            if proc.is_alive():
+                proc.join(timeout=2)
+            return
 
     threading.Thread(target=_runner, daemon=True).start()
 
@@ -190,7 +301,18 @@ def ingest_cancel_endpoint(task_id: str):
             return {"task_id": task_id, "status": task["status"]}
         task["cancel_event"].set()
         task["status"] = "cancelling"
-    return {"task_id": task_id, "status": "cancelling"}
+        proc = task.get("process")
+        if proc is not None and getattr(proc, "is_alive", None) and proc.is_alive():
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        # UI polling'in takılmaması için "best-effort" iptal:
+        # Proses terminate denendi; task durumu hemen "cancelled" yapılır.
+        task["status"] = "cancelled"
+        task["result"] = None
+        task["error"] = None
+    return {"task_id": task_id, "status": "cancelled"}
 
 
 @app.get("/ingest_status")
@@ -222,11 +344,13 @@ def list_branches(repo_url: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    _require_services()
     headers = {
         "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {settings.github_token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    if settings.github_token:
+        headers["Authorization"] = f"Bearer {settings.github_token}"
     branches: list[str] = []
     page = 1
     while page <= 5:  # pratik limit: ilk 500 branch yeterli
@@ -258,6 +382,7 @@ def list_branches(repo_url: str):
 
 @app.post("/sor", response_model=SoruYanit)
 async def ask(istek: SoruIstek):
+    _require_services()
     baslangic = time.time()
     
     # 1. Retrieval (Benzerlik araması ve skorlama)
@@ -299,7 +424,7 @@ async def ask(istek: SoruIstek):
         islem_suresi_ms=int((time.time() - baslangic) * 1000)
     )
 
-# ── Basit Web UI ───────────────────────────────────────────────────
+# ── Web UI ───────────────────────────────────────────────────
 import os
 from pathlib import Path
 

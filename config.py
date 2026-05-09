@@ -15,7 +15,7 @@ load_dotenv()
 class Settings:
     """Runtime settings loaded from environment variables."""
 
-    github_token: str
+    github_token: str | None
     groq_api_key: str
     pinecone_api_key: str
     pinecone_index_name: str
@@ -58,8 +58,9 @@ def _required_env(name: str) -> str:
 
 
 def get_settings() -> Settings:
+    github_token_raw = (os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN") or "").strip()
     return Settings(
-        github_token=_required_env("GITHUB_PERSONAL_ACCESS_TOKEN"),
+        github_token=github_token_raw or None,
         groq_api_key=_required_env("GROQ_API_KEY"),
         pinecone_api_key=_required_env("PINECONE_API_KEY"),
         pinecone_index_name=os.getenv("PINECONE_INDEX_NAME", "github-rag-analyzer"),
