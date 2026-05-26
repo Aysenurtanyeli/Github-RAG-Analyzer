@@ -135,9 +135,6 @@ GROQ_API_KEY=your_groq_key
 PINECONE_API_KEY=your_pinecone_key
 GITHUB_PERSONAL_ACCESS_TOKEN=ghp_...
 
-# Optional — can be left empty when using multiple repos
-# GITHUB_REPO_URL=owner/repo
-
 PINECONE_INDEX_NAME=github-rag-analyzer
 PINECONE_CLOUD=aws
 PINECONE_REGION=us-east-1
@@ -295,61 +292,6 @@ INGEST_FOCUS_PATHS=/core/,/domain/
 **Problem:** Loader can take a long time on large repos.
 
 **Solution:** `ingest_async` in a separate process; cancel via `ingest_cancel`. Batch embedding (groups of 40).
-
----
-
-## Deploy on Render
-
-This app is a **Web Service** (FastAPI + static UI), not a static site. Vectors live in Pinecone; the server only needs API keys at runtime.
-
-### Prerequisites
-
-- GitHub repo pushed (no `.env` in git)
-- [Render](https://render.com) account
-- Groq + Pinecone keys (optional: GitHub token for private repos)
-
-### Option A — Blueprint (`render.yaml`)
-
-1. Push the repo to GitHub (includes `render.yaml` and `runtime.txt`).
-2. Render Dashboard → **New** → **Blueprint** → connect the repo.
-3. Set secret env vars when prompted: `GROQ_API_KEY`, `PINECONE_API_KEY`, `GITHUB_PERSONAL_ACCESS_TOKEN`.
-4. Deploy. Open `https://<your-service>.onrender.com/ui`.
-
-### Option B — Manual Web Service
-
-1. **New** → **Web Service** → connect GitHub repo.
-2. Settings:
-   - **Runtime:** Python 3
-   - **Build command:** `pip install --upgrade pip && pip install -r requirements.txt`
-   - **Start command:** `uvicorn rag_api:app --host 0.0.0.0 --port $PORT`
-   - **Health check path:** `/`
-3. **Environment** (required):
-
-   | Key | Value |
-   |-----|--------|
-   | `GROQ_API_KEY` | your key |
-   | `PINECONE_API_KEY` | your key |
-   | `GITHUB_PERSONAL_ACCESS_TOKEN` | optional |
-   | `PINECONE_INDEX_NAME` | `github-rag-analyzer` |
-   | `PINECONE_CLOUD` | `aws` |
-   | `PINECONE_REGION` | `us-east-1` |
-
-   Do **not** commit `.env`. Leave `GITHUB_REPO_URL` empty if you only use the UI.
-
-4. **Create Web Service** → wait for build (first deploy may take several minutes while embedding models download).
-
-### After deploy
-
-- UI: `https://<service-name>.onrender.com/ui`
-- Status: `https://<service-name>.onrender.com/`
-- Ingest and chat work the same as locally; use **Force** when switching repos.
-
-### Render notes
-
-- **Plan:** Prefer **Starter** (or higher). Free tier has little RAM; `sentence-transformers` + ingest can OOM or time out.
-- **Cold start:** First request after idle loads the embedding model (30–90+ seconds possible).
-- **Long ingest:** Large repos may run several minutes; stay on the page until ingest completes.
-- **Secrets:** Rotate keys if they were ever committed; use Render env vars only.
 
 ---
 
