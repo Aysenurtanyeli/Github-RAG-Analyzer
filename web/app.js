@@ -5,7 +5,49 @@ const state = {
   busy: false,
   ingestTaskId: null,
   ingestPollTimer: null,
+  typeQueue: [],
+  typeTimer: null,
 };
+
+const TYPEWRITER_MS = 12;
+
+function resetTypewriter() {
+  state.typeQueue = [];
+  if (state.typeTimer) {
+    clearTimeout(state.typeTimer);
+    state.typeTimer = null;
+  }
+}
+
+function enqueueTypewriter(textEl, text) {
+  if (!text) return;
+  for (const ch of text) state.typeQueue.push({ textEl, ch });
+  if (!state.typeTimer) drainTypewriter();
+}
+
+function drainTypewriter() {
+  if (!state.typeQueue.length) {
+    state.typeTimer = null;
+    return;
+  }
+  const { textEl, ch } = state.typeQueue.shift();
+  textEl.textContent += ch;
+  scrollMessages();
+  state.typeTimer = setTimeout(drainTypewriter, TYPEWRITER_MS);
+}
+
+function waitTypewriterDone() {
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (!state.typeQueue.length && !state.typeTimer) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 20);
+    };
+    tick();
+  });
+}
 
 function setNamespace(ns) {
   state.namespace = ns || null;
@@ -19,6 +61,10 @@ function setBusy(b) {
   $("btnAsk").disabled = b;
   $("btnStopIngest").disabled = !(b && !!state.ingestTaskId);
   $("status").textContent = b ? "Çalışıyor…" : "Hazır";
+}
+
+function scrollMessages() {
+  $("messages").scrollTop = $("messages").scrollHeight;
 }
 
 function addMessage(role, text) {
@@ -36,7 +82,105 @@ function addMessage(role, text) {
   wrap.appendChild(r);
   wrap.appendChild(t);
   $("messages").appendChild(wrap);
-  $("messages").scrollTop = $("messages").scrollHeight;
+  scrollMessages();
+  return { wrap, textEl: t };
+}
+
+function addStreamingBotMessage() {
+  const wrap = document.createElement("div");
+  wrap.className = "msg bot";
+
+  const r = document.createElement("div");
+  r.className = "role";
+  r.textContent = "Asistan";
+
+  const t = document.createElement("div");
+  t.className = "text streaming";
+  t.textContent = "";
+
+  wrap.appendChild(r);
+  wrap.appendChild(t);
+  $("messages").appendChild(wrap);
+  scrollMessages();
+  return { wrap, textEl: t };
+}
+
+function finishStreamingMessage(textEl) {
+  textEl.classList.remove("streaming");
+  scrollMessages();
+}
+
+async function apiStreamSor(body, onToken) {
+  const res = await fetch("/sor/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = await res.json();
+      msg = j?.detail || j?.message || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let kaynaklar = [];
+  let islemMs = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+
+    for (const part of parts) {
+      const line = part.trim();
+      if (!line.startsWith("data:")) continue;
+      const raw = line.replace(/^data:\s*/, "");
+      if (!raw) continue;
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+
+      if (data.type === "token" && data.text) {
+        onToken(data.text);
+      } else if (data.type === "done") {
+        kaynaklar = data.kaynaklar || [];
+        islemMs = data.islem_suresi_ms;
+      } else if (data.type === "error") {
+        throw new Error(data.message || "Stream hatası");
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    const line = buffer.trim();
+    if (line.startsWith("data:")) {
+      try {
+        const data = JSON.parse(line.replace(/^data:\s*/, ""));
+        if (data.type === "token" && data.text) onToken(data.text);
+        else if (data.type === "done") {
+          kaynaklar = data.kaynaklar || [];
+          islemMs = data.islem_suresi_ms;
+        } else if (data.type === "error") {
+          throw new Error(data.message || "Stream hatası");
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message !== "Stream hatası") throw e;
+      }
+    }
+  }
+
+  return { kaynaklar, islem_suresi_ms: islemMs };
 }
 
 function showSources(items) {
@@ -292,12 +436,29 @@ $("btnAsk").addEventListener("click", async () => {
   showSources([]);
 
   setBusy(true);
+  resetTypewriter();
+  const { textEl } = addStreamingBotMessage();
+  textEl.textContent = "Yanıt hazırlanıyor…";
+  let gotToken = false;
   try {
-    const out = await api("/sor", { soru, top_k, namespace: state.namespace });
-    addMessage("bot", out.yanit || "");
+    const out = await apiStreamSor(
+      { soru, top_k, namespace: state.namespace },
+      (token) => {
+        if (!gotToken) {
+          gotToken = true;
+          textEl.textContent = "";
+        }
+        enqueueTypewriter(textEl, token);
+      }
+    );
+    await waitTypewriterDone();
+    finishStreamingMessage(textEl);
     showSources(out.kaynaklar || []);
   } catch (e) {
-    addMessage("bot", `Hata: ${e.message}`);
+    resetTypewriter();
+    finishStreamingMessage(textEl);
+    textEl.textContent = textEl.textContent.replace("Yanıt hazırlanıyor…", "") || `Hata: ${e.message}`;
+    if (!textEl.textContent.trim()) textEl.textContent = `Hata: ${e.message}`;
   } finally {
     setBusy(false);
   }
