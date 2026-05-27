@@ -4,9 +4,9 @@ services:
     name: github-rag-analyzer
     runtime: python
     plan: starter
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: uvicorn rag_api:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /
+    buildCommand: pip install --upgrade pip && pip install -r requirements-prod.txt
+    startCommand: uvicorn rag_api:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 75
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
@@ -24,3 +24,7 @@ services:
         value: us-east-1
       - key: GROQ_MODEL
         value: llama-3.3-70b-versatile
+      - key: EMBEDDING_PROVIDER
+        value: pinecone
+      - key: EMBEDDING_MODEL
+        value: llama-text-embed-v2
