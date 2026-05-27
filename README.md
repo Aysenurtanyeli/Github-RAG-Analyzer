@@ -9,7 +9,7 @@ Across web, mobile, backend API, desktop, data/ML scripts, and monorepos, it foc
 ## Features
 
 - Fetch files from GitHub (`GithubFileLoader`) with smart filtering (ignore / focus lists)
-- HuggingFace embeddings + Pinecone namespaces (isolation per repo + branch)
+- Pinecone hosted embeddings (default) or HuggingFace local embeddings + Pinecone namespaces
 - Web UI: repo ingest, branch selection, streaming chat
 - REST API: `/ingest_async`, `/sor`, `/sor/stream` (SSE)
 - Terminal: `ingest.py`, `ask.py`
@@ -139,6 +139,10 @@ PINECONE_INDEX_NAME=github-rag-analyzer
 PINECONE_CLOUD=aws
 PINECONE_REGION=us-east-1
 GROQ_MODEL=llama-3.3-70b-versatile
+
+# Embeddings (default: Pinecone hosted API)
+EMBEDDING_PROVIDER=pinecone
+EMBEDDING_MODEL=llama-text-embed-v2
 ```
 
 ### API and UI
@@ -182,6 +186,8 @@ Each repo gets its own Pinecone **namespace**: `owner__repo__branch`
 | `PINECONE_API_KEY` | Yes | — | Vector DB |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | No | — | Private repo / limits |
 | `GITHUB_REPO_URL` | No | — | Terminal ingest/ask only |
+| `EMBEDDING_PROVIDER` | No | `pinecone` | `pinecone` (hosted API) or `hf` (local model) |
+| `EMBEDDING_MODEL` | No | `llama-text-embed-v2` | Embedding model name for selected provider |
 | `PINECONE_INDEX_NAME` | No | `github-rag-analyzer` | Index name |
 | `CHUNK_SIZE` | No | `1000` | Chunk size |
 | `CHUNK_OVERLAP` | No | `80` | Overlap |

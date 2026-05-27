@@ -23,6 +23,7 @@ class Settings:
     pinecone_region: str
     repo_url: str | None
     repo_branch: str
+    embedding_provider: str
     embedding_model: str
     retriever_k: int
     llm_model: str
@@ -96,8 +97,9 @@ def get_settings() -> Settings:
         pinecone_region=os.getenv("PINECONE_REGION", "us-east-1"),
         repo_url=_optional_repo_url(),
         repo_branch=os.getenv("GITHUB_REPO_BRANCH", "main"),
+        embedding_provider=os.getenv("EMBEDDING_PROVIDER", "pinecone").strip().lower(),
         embedding_model=os.getenv(
-            "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+            "EMBEDDING_MODEL", "llama-text-embed-v2"
         ),
         retriever_k=int(os.getenv("RETRIEVER_TOP_K", "4")),
         llm_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),

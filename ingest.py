@@ -13,7 +13,6 @@ from urllib.parse import urlparse
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
 from langchain_community.document_loaders.github import GithubFileLoader
 from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 from pinecone.exceptions import NotFoundException
@@ -21,6 +20,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from config import get_settings, namespace_for_repo
+from embeddings_provider import build_embeddings
 
 console = Console()
 
@@ -657,7 +657,7 @@ def ingest_repo(
         raise IngestCancelled()
 
     settings = get_settings()
-    embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
+    embeddings = build_embeddings(settings)
 
     dim_probe = embeddings.embed_query("dimension probe")
     index = _ensure_pinecone_index(
