@@ -1,4 +1,4 @@
-simsimd==5.7.3 --only-binary=:all:
+simsimd==6.5.16
 langchain
 langchain-community
 langchain-huggingface
