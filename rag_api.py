@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+import asyncio
+import json
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import time
@@ -15,12 +17,13 @@ import requests
 
 # Kendi modüllerini import et
 from config import get_settings
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 
+from embeddings_provider import build_embeddings
 from ingest import IngestCancelled, ingest_repo
+from rag_prompts import build_rag_prompt, rerank_retrieved_docs
 
 app = FastAPI(
     title="GitHub Repo RAG API",
@@ -53,8 +56,13 @@ def _init_services() -> None:
         return
     try:
         settings = get_settings()
-        embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
-        llm = ChatGroq(temperature=0, model_name=settings.llm_model, groq_api_key=settings.groq_api_key)
+        embeddings = build_embeddings(settings)
+        llm = ChatGroq(
+            temperature=0,
+            model_name=settings.llm_model,
+            groq_api_key=settings.groq_api_key,
+            streaming=True,
+        )
 
         pc = Pinecone(api_key=settings.pinecone_api_key)
         existing = {idx["name"] for idx in pc.list_indexes()}
@@ -115,7 +123,16 @@ def _ingest_worker(
 
 def _default_namespace() -> str:
     _require_services()
-    return f"{settings.repo_name.replace('/', '__')}__{settings.repo_branch}"
+    ns = settings.default_namespace()
+    if not ns:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "namespace gerekli. UI'da önce ingest yapın veya istekte namespace gönderin. "
+                "Terminal için .env içine GITHUB_REPO_URL ekleyebilirsiniz."
+            ),
+        )
+    return ns
 
 def _vectorstore(namespace: str) -> PineconeVectorStore:
     _require_services()
@@ -136,7 +153,10 @@ def _repo_name_from_url(repo_url: str) -> str:
 class SoruIstek(BaseModel):
     soru: str = Field(..., min_length=2, description="Sormak istediğiniz soru")
     top_k: int = Field(default=4, ge=1, le=10)
-    namespace: Optional[str] = Field(default=None, description="Repo namespace (boşsa default repo)")
+    namespace: Optional[str] = Field(
+        default=None,
+        description="Pinecone namespace (ingest sonrası). Boşsa yalnızca .env'de GITHUB_REPO_URL varsa kullanılır.",
+    )
 
 class IngestIstek(BaseModel):
     repo_url: str = Field(..., min_length=3, description="GitHub repo URL veya owner/repo")
@@ -168,29 +188,31 @@ def status():
         return {
             "durum": "degraded",
             "hata": SERVICE_INIT_ERROR or "Settings yüklenemedi.",
-            "gerekli_env": [
+            "gerekli_env": ["GROQ_API_KEY", "PINECONE_API_KEY"],
+            "opsiyonel_env": [
                 "GITHUB_PERSONAL_ACCESS_TOKEN",
-                "GROQ_API_KEY",
-                "PINECONE_API_KEY",
                 "GITHUB_REPO_URL",
             ],
             "ui": "/ui",
         }
 
-    ns = f"{settings.repo_name.replace('/', '__')}__{settings.repo_branch}"
-    try:
-        stats = pinecone_index.describe_index_stats()
-        ns_count = int((stats.get("namespaces") or {}).get(ns, {}).get("vector_count") or 0)
-    except Exception:
-        ns_count = None
+    ns = settings.default_namespace()
+    ns_count = None
+    if ns:
+        try:
+            stats = pinecone_index.describe_index_stats()
+            ns_count = int((stats.get("namespaces") or {}).get(ns, {}).get("vector_count") or 0)
+        except Exception:
+            ns_count = None
     return {
         "durum": "online",
-        "default_repo": settings.repo_name,
-        "default_branch": settings.repo_branch,
+        "default_repo": settings.repo_name if settings.has_default_repo else None,
+        "default_branch": settings.repo_branch if settings.has_default_repo else None,
         "pinecone_index": settings.pinecone_index_name,
         "default_namespace": ns,
         "toplam_chunk": ns_count,
         "ui": "/ui",
+        "repo_env_optional": not settings.has_default_repo,
         "settings": {k: v for k, v in asdict(settings).items() if k not in {"github_token", "groq_api_key", "pinecone_api_key"}},
     }
 
@@ -380,12 +402,8 @@ def list_branches(repo_url: str):
     uniq.sort(key=lambda x: (0 if x in preferred else 1, x.lower()))
     return {"repo": repo_name, "branches": uniq[:200]}
 
-@app.post("/sor", response_model=SoruYanit)
-async def ask(istek: SoruIstek):
-    _require_services()
-    baslangic = time.time()
-    
-    # 1. Retrieval (Benzerlik araması ve skorlama)
+def _prepare_ask_context(istek: SoruIstek) -> tuple[str, list[KaynakBilgi], str]:
+    """Retrieve repo context and build the LLM prompt."""
     ns = istek.namespace or _default_namespace()
     try:
         stats = pinecone_index.describe_index_stats()
@@ -397,31 +415,89 @@ async def ask(istek: SoruIstek):
             status_code=404,
             detail="Bu repo için veri bulunamadı. Önce 'Ingest Başlat' ile yükleyin.",
         )
-    results = _vectorstore(ns).similarity_search_with_score(istek.soru, k=istek.top_k)
-    
+
+    fetch_k = min(max(istek.top_k * 3, istek.top_k), 12)
+    results = _vectorstore(ns).similarity_search_with_score(istek.soru, k=fetch_k)
     if not results:
         raise HTTPException(status_code=404, detail="İlgili bilgi bulunamadı.")
 
-    # 2. Augment (Bağlam oluşturma)
+    docs_only = [doc for doc, _score in results]
+    ranked_docs = rerank_retrieved_docs(docs_only, istek.top_k)
+    score_by_id = {id(doc): score for doc, score in results}
+    results = [(doc, score_by_id.get(id(doc), 0.0)) for doc in ranked_docs]
+
     context_text = ""
-    sources = []
+    sources: list[KaynakBilgi] = []
     for doc, score in results:
         context_text += f"\n---\nKAYNAK: {doc.metadata.get('source')}\nİÇERİK: {doc.page_content}\n"
-        sources.append(KaynakBilgi(
-            dosya=doc.metadata.get("source", "Bilinmiyor"),
-            benzerlik_skoru=round(float(score), 4)
-        ))
+        sources.append(
+            KaynakBilgi(
+                dosya=doc.metadata.get("source", "Bilinmiyor"),
+                benzerlik_skoru=round(float(score), 4),
+            )
+        )
 
-    # 3. Generate (LLM Yanıtı)
-    sistem_mesaji = f"Sen bir yazılım uzmanısın. Aşağıdaki kod parçalarını ve dökümanları kullanarak soruyu yanıtla.\n\nBAĞLAM:\n{context_text}"
-    full_prompt = f"{sistem_mesaji}\n\nSORU: {istek.soru}"
-    
+    full_prompt = build_rag_prompt(question=istek.soru, context=context_text)
+    return full_prompt, sources, ns
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _text_pieces(text: str, *, size: int = 2) -> list[str]:
+    if not text:
+        return []
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+@app.post("/sor", response_model=SoruYanit)
+async def ask(istek: SoruIstek):
+    _require_services()
+    baslangic = time.time()
+    full_prompt, sources, _ns = _prepare_ask_context(istek)
     response = llm.invoke(full_prompt)
-    
     return SoruYanit(
         yanit=response.content,
         kaynaklar=sources,
-        islem_suresi_ms=int((time.time() - baslangic) * 1000)
+        islem_suresi_ms=int((time.time() - baslangic) * 1000),
+    )
+
+
+@app.post("/sor/stream")
+async def ask_stream(istek: SoruIstek):
+    """Server-Sent Events: LLM yanıtı parça parça akar."""
+    _require_services()
+    baslangic = time.time()
+    full_prompt, sources, _ns = _prepare_ask_context(istek)
+    sources_payload = [s.model_dump() for s in sources]
+
+    async def event_stream():
+        yield ": stream-open\n\n"
+        try:
+            async for chunk in llm.astream(full_prompt):
+                text = getattr(chunk, "content", None) or ""
+                for piece in _text_pieces(text, size=2):
+                    yield _sse({"type": "token", "text": piece})
+                    await asyncio.sleep(0)
+            yield _sse(
+                {
+                    "type": "done",
+                    "kaynaklar": sources_payload,
+                    "islem_suresi_ms": int((time.time() - baslangic) * 1000),
+                }
+            )
+        except Exception as e:
+            yield _sse({"type": "error", "message": str(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 # ── Web UI ───────────────────────────────────────────────────
@@ -430,12 +506,28 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
+
+_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+}
+
+
+class NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if path.endswith((".js", ".css", ".html")):
+            response.headers.update(_NO_CACHE_HEADERS)
+        return response
+
+
 if WEB_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+    app.mount("/static", NoCacheStaticFiles(directory=str(WEB_DIR)), name="static")
+
 
 @app.get("/ui")
 def ui():
     index = WEB_DIR / "index.html"
     if not index.exists():
         raise HTTPException(status_code=404, detail="UI dosyası bulunamadı. web/index.html eksik.")
-    return FileResponse(str(index))
+    return FileResponse(str(index), headers=_NO_CACHE_HEADERS)
