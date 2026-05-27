@@ -1,0 +1,10 @@
+# Render / production: Pinecone hosted embeddings only (no sentence-transformers).
+langchain
+langchain-community
+langchain-groq
+langchain-pinecone
+pinecone
+python-dotenv
+rich
+fastapi
+uvicorn

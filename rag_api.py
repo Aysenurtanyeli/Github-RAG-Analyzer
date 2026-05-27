@@ -181,6 +181,12 @@ class SoruYanit(BaseModel):
 
 # ── Endpoint'ler ───────────────────────────────────────────────────
 
+@app.get("/health")
+def health():
+    """Lightweight probe for Render/load balancers (no Pinecone/Groq init)."""
+    return {"status": "ok"}
+
+
 @app.get("/")
 def status():
     _init_services()
