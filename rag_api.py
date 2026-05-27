@@ -17,11 +17,11 @@ import requests
 
 # Kendi modüllerini import et
 from config import get_settings
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 
+from embeddings_provider import build_embeddings
 from ingest import IngestCancelled, ingest_repo
 from rag_prompts import build_rag_prompt, rerank_retrieved_docs
 
@@ -56,7 +56,7 @@ def _init_services() -> None:
         return
     try:
         settings = get_settings()
-        embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
+        embeddings = build_embeddings(settings)
         llm = ChatGroq(
             temperature=0,
             model_name=settings.llm_model,

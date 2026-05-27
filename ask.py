@@ -6,7 +6,6 @@ from typing import Iterable
 
 from groq import BadRequestError
 from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 from rich.console import Console
@@ -14,6 +13,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 from config import get_settings, namespace_for_repo
+from embeddings_provider import build_embeddings
 from rag_prompts import build_rag_prompt, rerank_retrieved_docs
 
 console = Console()
@@ -54,7 +54,7 @@ def main() -> None:
         )
         raise SystemExit(1)
 
-    embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
+    embeddings = build_embeddings(settings)
     pc = Pinecone(api_key=settings.pinecone_api_key)
     existing = {idx["name"] for idx in pc.list_indexes()}
     dim_probe = embeddings.embed_query("dimension probe")
